@@ -1,0 +1,47 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-etl_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-etl_password}
+      POSTGRES_DB: ${POSTGRES_DB:-etl_db}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  metabase:
+    image: metabase/metabase:latest
+    ports:
+      - "3000:3000"
+    depends_on:
+      - postgres
+    environment:
+      MB_DB_TYPE: "postgres"
+      MB_DB_DBNAME: "${POSTGRES_DB:-etl_db}"
+      MB_DB_PORT: "5432"
+      MB_DB_USER: "${POSTGRES_USER:-etl_user}"
+      MB_DB_PASS: "${POSTGRES_PASSWORD:-etl_password}"
+      MB_DB_HOST: "postgres"
+
+  pipeline:
+    build: ./pipeline
+    volumes:
+      - ./data:/data:ro
+    environment:
+      - INTERVAL_MINUTES=${INTERVAL_MINUTES:-60}
+      - CSV_PATH=${CSV_PATH:-/data/input.csv}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=${POSTGRES_PORT:-5432}
+      - PII_SALT=${PII_SALT:-my_super_secret_salt}
+    depends_on:
+      - postgres
+    restart: unless-stopped
+
+volumes:
+  pgdata:
