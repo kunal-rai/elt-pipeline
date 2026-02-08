@@ -165,13 +165,13 @@ docker-compose -f docker-compose.airflow.yml down -v
 
 ## Common Commands
 
-# Start services
+## Start services
 docker-compose up -d
 
-# Stop services and remove all data
+## Stop services and remove all data
 docker-compose down -v
 
-# View pipeline logs
+## View pipeline logs
 docker-compose logs pipeline
 
 ----
