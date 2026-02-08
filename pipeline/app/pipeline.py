@@ -1,6 +1,6 @@
 # pipeline/app/pipeline.py
 """
-PySpark ELT pipeline for HG Insights assignment.
+PySpark ELT pipeline.
 
 Flow:
 1. Read CSV into Spark
