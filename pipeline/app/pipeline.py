@@ -1,256 +1,201 @@
 # pipeline/app/pipeline.py
 """
-PySpark-based pipeline:
-- Reads CSV from disk into Spark DataFrame
-- Writes raw to staging via JDBC
-- Reads staging via JDBC, applies defaults and PII anonymisation, writes to report via JDBC
-- Writes a single-row metrics entry into report.pipeline_runs
+PySpark ELT pipeline for HG Insights assignment.
+
+Flow:
+1. Read CSV into Spark
+2. Write raw data to Postgres staging schema
+3. Transform data:
+   - Apply defaults for missing values
+   - Anonymise PII (CustomerID)
+4. Write transformed data to reporting schema
+5. Record pipeline run metrics
+
+Author: <Your Name>
 """
 
-import time
-import os
-import hmac
-import hashlib
-import json
 import sys
-from typing import List
+import time
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, sha2, concat_ws, lit
+from pyspark.sql.types import DoubleType, IntegerType
 
 from sqlalchemy.exc import SQLAlchemyError
 
 from db_utils import ensure_schemas
-from config import CSV_PATH, PII_SALT, POSTGRES_HOST, POSTGRES_PORT, POSTGRES_DB, POSTGRES_USER, POSTGRES_PASSWORD
-from db_utils import engine
+from config import (
+    CSV_PATH,
+    POSTGRES_HOST,
+    POSTGRES_PORT,
+    POSTGRES_DB,
+    POSTGRES_USER,
+    POSTGRES_PASSWORD,
+    PII_SALT,
+)
 
-# PySpark imports
-from pyspark.sql import SparkSession, DataFrame
-from pyspark.sql.functions import col, udf, lit, when
-from pyspark.sql.types import StringType, DoubleType, IntegerType
-
-# Defaults (same meaning as pandas version)
-DEFAULTS = {
-    'tenure': 0,
-    'MonthlyCharges': 0.0,
-    'TotalCharges': 0.0,
-    'gender': 'Unknown',
-}
-
-# PII columns to anonymise (dataset-agnostic). Keep 'customerID' / 'customerid' mapping in mind.
-PII_COLUMNS = ['customerID', 'customerid']
-
-# JDBC driver path (downloaded in Dockerfile)
 JDBC_DRIVER_PATH = "/opt/jdbc/postgresql.jar"
 
-def _build_jdbc_url():
-    # Spark JDBC expects jdbc:postgresql://host:port/db
-    host = POSTGRES_HOST or os.getenv('POSTGRES_HOST', 'postgres')
-    port = POSTGRES_PORT or os.getenv('POSTGRES_PORT', '5432')
-    db = POSTGRES_DB or os.getenv('POSTGRES_DB', 'etl_db')
+
+# ----------------------------
+# Configuration (dataset-aware)
+# ----------------------------
+
+# Defaults applied ONLY to known columns
+DEFAULTS = {
+    "Age": 0,
+    "Tenure": 0,
+    "MonthlyCharges": 0.0,
+    "TotalCharges": 0.0,
+    "Gender": "Unknown",
+    "InternetService": "Unknown",
+    "TechSupport": "Unknown",
+}
+
+# Only CustomerID is treated as PII for this dataset
+PII_COLUMN = "CustomerID"
+
+
+# ----------------------------
+# Helpers
+# ----------------------------
+
+def _jdbc_url():
+    host = POSTGRES_HOST or "postgres"
+    port = POSTGRES_PORT or "5432"
+    db = POSTGRES_DB or "etl_db"
     return f"jdbc:postgresql://{host}:{port}/{db}"
 
-def _create_spark(app_name="elt_pipeline"):
-    """
-    Create a local SparkSession configured to use the Postgres JDBC driver jar.
-    """
-    jdbc_jar = JDBC_DRIVER_PATH
-    builder = SparkSession.builder.appName(app_name) \
-        .config("spark.jars", jdbc_jar) \
-        .config("spark.driver.extraClassPath", jdbc_jar) \
-        .config("spark.sql.session.timeZone", "UTC") \
-        .master("local[*]")  # use all cores available
-    spark = builder.getOrCreate()
-    return spark
 
-def _hmac_hash_py(val: str) -> str:
-    if val is None:
-        return None
-    # handle NaNs passed as float
-    try:
-        if isinstance(val, float):
-            # check NaN
-            import math
-            if math.isnan(val):
-                return None
-    except Exception:
-        pass
-    s = str(val).encode('utf-8')
-    salt = (PII_SALT or os.getenv('PII_SALT', 'my_super_secret_salt')).encode('utf-8')
-    return hmac.new(salt, s, hashlib.sha256).hexdigest()
+def _spark_session():
+    return (
+        SparkSession.builder
+        .appName("elt_pipeline")
+        .master("local[*]")
+        .config("spark.jars", JDBC_DRIVER_PATH)
+        .config("spark.driver.extraClassPath", JDBC_DRIVER_PATH)
+        .config("spark.sql.session.timeZone", "UTC")
+        .getOrCreate()
+    )
 
-# register udf
-_hmac_hash_udf = udf(_hmac_hash_py, StringType())
 
-def _safe_write_jdbc(df: DataFrame, table: str, mode: str = "overwrite"):
-    """
-    Write a Spark DataFrame to Postgres via JDBC. Retries a few times if DB not ready.
-    """
-    jdbc_url = _build_jdbc_url()
-    user = POSTGRES_USER or os.getenv('POSTGRES_USER', 'etl_user')
-    password = POSTGRES_PASSWORD or os.getenv('POSTGRES_PASSWORD', 'etl_password')
-    props = {
-        "user": user,
-        "password": password,
-        "driver": "org.postgresql.Driver"
-    }
+def _jdbc_write(df, table, mode="overwrite"):
+    url = _jdbc_url()
+    user = POSTGRES_USER or "etl_user"
+    password = POSTGRES_PASSWORD or "etl_password"
 
-    # Try a few times to avoid race with DB startup
-    attempts = 0
-    while attempts < 5:
+    for attempt in range(1, 6):
         try:
             df.write.format("jdbc") \
-                .option("url", jdbc_url) \
+                .option("url", url) \
                 .option("dbtable", table) \
-                .option("user", props["user"]) \
-                .option("password", props["password"]) \
-                .option("driver", props["driver"]) \
+                .option("user", user) \
+                .option("password", password) \
+                .option("driver", "org.postgresql.Driver") \
                 .mode(mode) \
                 .save()
             return
         except Exception as e:
-            attempts += 1
-            wait = 2 ** attempts
-            print(f"JDBC write attempt {attempts} failed for table {table}: {e} — retrying in {wait}s", file=sys.stderr)
+            wait = 2 ** attempt
+            print(f"JDBC write failed (attempt {attempt}): {e}. Retrying in {wait}s", file=sys.stderr)
             time.sleep(wait)
-    # If we reach here, raise final exception
-    raise RuntimeError(f"Failed to write to JDBC table {table} after {attempts} attempts")
 
-def ingest(spark: SparkSession) -> int:
+    raise RuntimeError(f"Failed to write table {table}")
+
+
+# ----------------------------
+# Pipeline steps
+# ----------------------------
+
+def ingest(spark):
     """
-    Read CSV from CSV_PATH into Spark, write raw to staging.customers
-    Returns number of rows read.
+    Read CSV and write raw data to staging.customers
     """
-    print(f"Ingesting from {CSV_PATH}")
-    # read with header and infer schema (you may tune inferSchema=False for performance)
+    print(f"Reading CSV from {CSV_PATH}")
     df = spark.read.option("header", "true").option("inferSchema", "true").csv(CSV_PATH)
-    rows = df.count()
-    print(f"Read {rows} rows")
+    row_count = df.count()
 
-    # ensure schemas exist (uses db_utils via SQLAlchemy)
     try:
         ensure_schemas()
     except SQLAlchemyError as e:
-        print("Error ensuring schemas (SQLAlchemy):", e)
-        # continue and let JDBC writes handle retries
-    # Write to staging.customers
-    _safe_write_jdbc(df, "staging.customers", mode="overwrite")
-    return rows
+        print("Schema creation warning:", e, file=sys.stderr)
 
-def transform(spark: SparkSession) -> int:
+    _jdbc_write(df, "staging.customers", mode="overwrite")
+    return row_count
+
+
+def transform(spark):
     """
-    Read staging.customers via JDBC into Spark, apply defaults and anonymisation,
-    then write to report.customers
+    Apply defaults and PII anonymisation, write to report.customers
     """
-    jdbc_url = _build_jdbc_url()
-    user = POSTGRES_USER or os.getenv('POSTGRES_USER', 'etl_user')
-    password = POSTGRES_PASSWORD or os.getenv('POSTGRES_PASSWORD', 'etl_password')
+    url = _jdbc_url()
+    user = POSTGRES_USER or "etl_user"
+    password = POSTGRES_PASSWORD or "etl_password"
 
-    # Read staging.customers via JDBC
-    read_attempts = 0
-    while read_attempts < 5:
-        try:
-            staging_df = spark.read.format("jdbc") \
-                .option("url", jdbc_url) \
-                .option("dbtable", "staging.customers") \
-                .option("user", user) \
-                .option("password", password) \
-                .option("driver", "org.postgresql.Driver") \
-                .load()
-            break
-        except Exception as e:
-            read_attempts += 1
-            wait = 2 ** read_attempts
-            print(f"JDBC read attempt {read_attempts} failed: {e} — retrying in {wait}s", file=sys.stderr)
-            time.sleep(wait)
-    else:
-        raise RuntimeError("Failed to read staging.customers via JDBC")
+    df = (
+        spark.read.format("jdbc")
+        .option("url", url)
+        .option("dbtable", "staging.customers")
+        .option("user", user)
+        .option("password", password)
+        .option("driver", "org.postgresql.Driver")
+        .load()
+    )
 
-    df = staging_df
+    # Apply defaults
+    for col_name, default in DEFAULTS.items():
+        if col_name in df.columns:
+            df = df.na.fill({col_name: default})
 
-    # Apply defaults using na.fill for strings/numerics where possible
-    # NOTE: Spark's na.fill accepts dict mapping column -> value
-    fill_map = {}
-    for k, v in DEFAULTS.items():
-        if k in df.columns:
-            fill_map[k] = v
-    if fill_map:
-        df = df.na.fill(fill_map)
+    # Enforce numeric types
+    if "Age" in df.columns:
+        df = df.withColumn("Age", col("Age").cast(IntegerType()))
+    if "Tenure" in df.columns:
+        df = df.withColumn("Tenure", col("Tenure").cast(IntegerType()))
+    if "MonthlyCharges" in df.columns:
+        df = df.withColumn("MonthlyCharges", col("MonthlyCharges").cast(DoubleType()))
+    if "TotalCharges" in df.columns:
+        df = df.withColumn("TotalCharges", col("TotalCharges").cast(DoubleType()))
 
-    # Ensure numeric columns are coerced to numeric types and filled
-    for numeric_col in ['MonthlyCharges', 'TotalCharges', 'tenure']:
-        if numeric_col in df.columns:
-            try:
-                df = df.withColumn(numeric_col, col(numeric_col).cast(DoubleType()))
-                df = df.na.fill({numeric_col: float(DEFAULTS.get(numeric_col, 0))})
-            except Exception:
-                # fallback: leave as-is
-                pass
+    # Anonymise PII
+    if PII_COLUMN in df.columns:
+        salt = PII_SALT or "hg_insights_salt"
+        df = df.withColumn(
+            PII_COLUMN,
+            sha2(concat_ws("", col(PII_COLUMN).cast("string"), lit(salt)), 256)
+        )
 
-    # Apply anonymisation for PII columns
-    for c in PII_COLUMNS:
-        if c in df.columns:
-            df = df.withColumn(c, _hmac_hash_udf(col(c)))
+    _jdbc_write(df, "report.customers", mode="overwrite")
+    return df.count()
 
-    # Write to report.customers
-    _safe_write_jdbc(df, "report.customers", mode="overwrite")
-    rows = df.count()
-    return rows
 
-def write_metrics(rows_in: int, rows_out: int, duration: float, success: bool = True):
-    """
-    Write a single-row metrics entry to report.pipeline_runs using Spark's JDBC write.
-    """
-    # Build a SparkSession only if not provided
+def write_metrics(rows_in, rows_out, duration, success=True):
     spark = SparkSession.builder.getOrCreate()
+    data = [(rows_in, rows_out, duration, success)]
+    cols = ["rows_ingested", "rows_transformed", "duration_seconds", "success"]
+    df = spark.createDataFrame(data, cols)
+    _jdbc_write(df, "report.pipeline_runs", mode="append")
 
-    data = [(rows_in, rows_out, float(duration), success)]
-    schema = ["rows_ingested", "rows_transformed", "duration_seconds", "success"]
-    metrics_df = spark.createDataFrame(data, schema)
-    # Add run_ts default in DB (report.pipeline_runs has default now())
-    # We'll insert with mode='append' to add new row
-    jdbc_url = _build_jdbc_url()
-    user = POSTGRES_USER or os.getenv('POSTGRES_USER', 'etl_user')
-    password = POSTGRES_PASSWORD or os.getenv('POSTGRES_PASSWORD', 'etl_password')
-    attempts = 0
-    while attempts < 5:
-        try:
-            metrics_df.write.format("jdbc") \
-                .option("url", jdbc_url) \
-                .option("dbtable", "report.pipeline_runs") \
-                .option("user", user) \
-                .option("password", password) \
-                .option("driver", "org.postgresql.Driver") \
-                .mode("append") \
-                .save()
-            return
-        except Exception as e:
-            attempts += 1
-            wait = 2 ** attempts
-            print(f"Metrics write attempt {attempts} failed: {e} — retrying in {wait}s", file=sys.stderr)
-            time.sleep(wait)
-    raise RuntimeError("Failed to write pipeline metrics after retries")
 
 def run_pipeline():
-    """
-    Main entrypoint: create Spark, run ingestion + transform, write metrics
-    """
-    print('--- Pipeline run starting (PySpark) ---')
-    t0 = time.time()
-    spark = _create_spark()
+    print("Starting ELT pipeline")
+    start = time.time()
+    spark = _spark_session()
+
     try:
         rows_in = ingest(spark)
         rows_out = transform(spark)
-        duration = time.time() - t0
-        write_metrics(rows_in, rows_out, duration, success=True)
-        print(f'Pipeline success: ingested={rows_in} transformed={rows_out} duration={duration:.2f}s')
+        duration = time.time() - start
+        write_metrics(rows_in, rows_out, duration, True)
+        print(f"Pipeline succeeded | ingested={rows_in} transformed={rows_out}")
     except Exception as e:
-        duration = time.time() - t0
-        try:
-            write_metrics(0, 0, duration, success=False)
-        except Exception as inner:
-            print("Failed to write failed-run metrics:", inner, file=sys.stderr)
-        print('Pipeline failed:', e, file=sys.stderr)
+        duration = time.time() - start
+        write_metrics(0, 0, duration, False)
+        print("Pipeline failed:", e, file=sys.stderr)
         raise
     finally:
-        try:
-            spark.stop()
-        except Exception:
-            pass
+        spark.stop()
+
+
+if __name__ == "__main__":
+    run_pipeline()

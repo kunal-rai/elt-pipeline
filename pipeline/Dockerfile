@@ -30,4 +30,4 @@ COPY app ./app
 
 ENV PYTHONUNBUFFERED=1
 
-CMD ["python","app/scheduler.py"]
+CMD ["sleep","infinity"]

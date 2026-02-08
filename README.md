@@ -1,40 +1,39 @@
-# ELT Pipeline — Airflow Orchestrated (Runnable on Laptop)
+# ELT Pipeline — Airflow Orchestrated (demo-ready)
 
-This repository contains a **fully containerised ELT pipeline** orchestrated using **Apache Airflow**.
-The solution is designed in such a way, we just need to **clone the repo and run everything locally using Docker only**.
+This repository contains a **fully containerised ELT pipeline** orchestrated with **Apache Airflow**.
+It is designed to run locally using **Docker only** (no cloud required) and demonstrates:
 
-No cloud setup is required.
-
----
-
-## What This Pipeline Does
-
-1. Reads a CSV file
-2. Loads raw data into a **staging schema** in Postgres
-3. Transforms data using **PySpark**:
-   - Fills missing values using defaults
-   - Anonymises PII fields
-4. Loads transformed data into a **reporting schema**
-5. Tracks pipeline execution metrics
-6. Orchestrates execution using **Apache Airflow**
-7. Visualises results using **Metabase**
+- CSV ingestion → staging (Postgres)
+- PySpark-based transformation (defaults + PII anonymisation)
+- Load into reporting schema for analytics
+- Orchestration via Airflow (hourly configurable)
+- Observability via Metabase dashboards
+- All services defined with Docker Compose
 
 ---
 
-## Prerequisites (Mandatory)
-
+## Prerequisites (mandatory)
 - Docker Desktop (running)
-- Git
-
-That’s it.
+- Docker Compose (bundled with Docker Desktop)
+- Git  
+Recommended: allocate **~8 GB** RAM to Docker for smooth Airflow + Postgres + Spark runs.
 
 ---
 
-## Step 1 — Clone the Repository
+## Quick overview
+- Input CSV path: `./data/input.csv`
+- Staging table: `staging.customers`
+- Reporting table: `report.customers`
+- Pipeline entrypoint: `app/run_once.py`
+- Orchestration Airflow DAG: `elt_pipeline_dag` (http://localhost:8080/)
+- Reporting UI: Metabase (http://localhost:3000)
+
+---
+
+## 1) Clone repository
 
 git clone <YOUR_GITHUB_REPO_URL>
 cd <REPO_NAME>
-```
 
 ---
 
@@ -55,11 +54,16 @@ Place the input dataset at:
 
 Always start from a clean state:
 
-docker-compose down -v
+docker-compose -f docker-compose.airflow.yml down -v
 
 Start the full stack:
 
 docker-compose -f docker-compose.airflow.yml up --build -d
+
+If you edit pipeline code or Dockerfile, rebuild the pipeline image explicitly:
+
+docker-compose -f docker-compose.airflow.yml build --no-cache pipeline
+docker-compose -f docker-compose.airflow.yml up -d
 
 This starts:
 - Postgres
@@ -78,7 +82,7 @@ http://localhost:8080
 Login credentials:
 
 Username: admin  
-Password: 5pQ9nnZhVEVXr4A7
+Password: admin@123 
 
 To confirm Airflow started correctly:
 
@@ -125,8 +129,8 @@ docker-compose -f docker-compose.airflow.yml exec postgres \
 psql -U etl_user -d etl_db
 
 
-SELECT COUNT(*) FROM staging.customers;
-SELECT COUNT(*) FROM report.customers;
+SELECT COUNT(*) FROM staging.customers; # source table
+SELECT COUNT(*) FROM report.customers;  # target table
 SELECT * FROM report.pipeline_runs ORDER BY run_ts DESC LIMIT 5;
 
 Exit with:
