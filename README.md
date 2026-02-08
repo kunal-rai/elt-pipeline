@@ -3,6 +3,9 @@
 This repository contains a **fully containerised ELT pipeline** orchestrated with **Apache Airflow**.
 It is designed to run locally using **Docker only** (no cloud required) and demonstrates:
 
+<img width="1536" height="1024" alt="image" src="https://github.com/user-attachments/assets/49876fdc-afc8-4f03-b033-859f06cd254b" />
+
+
 - CSV ingestion → staging (Postgres)
 - PySpark-based transformation (defaults + PII anonymisation)
 - Load into reporting schema for analytics
